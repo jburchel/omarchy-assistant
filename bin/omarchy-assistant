@@ -2,8 +2,11 @@
 """Omarchy Assistant engine.
 
   omarchy-assistant backends                  which AI tools are installed (JSON)
-  omarchy-assistant ask [--backend B] TEXT    investigate read-only, print progress
-                                              and a proposal as JSON lines
+  omarchy-assistant ask [--backend B] --stdin investigate read-only, print progress
+                                              and a proposal as JSON lines; the request
+                                              is one JSON string line on stdin (TEXT
+                                              arguments also work, but are visible to
+                                              other users in the process list)
   omarchy-assistant preview FILE              diff and checks for a proposal (JSON)
   omarchy-assistant apply FILE                back up, apply, validate, auto-revert
   omarchy-assistant undo [ID|last]            put a change back
@@ -28,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 
 HOME = os.path.expanduser("~")
@@ -303,15 +307,32 @@ def extract(text):
     return p
 
 
+def start_with_stdin(argv, workdir, prompt):
+    """Start an AI tool with the prompt on stdin. The prompt holds the
+    request and machine details, and a command line is readable by every
+    local user (/proc/<pid>/cmdline), so it never goes in argv."""
+    proc = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def feed():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    return proc
+
+
 def ask_claude(prompt, workdir):
-    argv = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+    argv = ["claude", "-p", "--output-format", "stream-json", "--verbose",
             "--restricted", "--strict-mcp-config", "--no-session-persistence",
             "--permission-mode", "default",
             "--tools", "Read,Grep,Glob,Bash",
             "--allowedTools", "Read", "Grep", "Glob", f"Bash({SELF} probe:*)",
             "--add-dir", "/usr/share/omarchy", os.path.join(HOME, ".config"), os.path.join(HOME, ".local/share/applications")]
     final = ""
-    proc = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = start_with_stdin(argv, workdir, prompt)
     try:
         for line in proc.stdout:
             try:
@@ -340,8 +361,8 @@ def ask_claude(prompt, workdir):
 def ask_codex(prompt, workdir):
     last = os.path.join(workdir, "last-message.txt")
     argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral",
-            "--json", "-C", workdir, "-o", last, prompt]
-    proc = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            "--json", "-C", workdir, "-o", last, "-"]
+    proc = start_with_stdin(argv, workdir, prompt)
     try:
         for line in proc.stdout:
             try:
@@ -374,7 +395,13 @@ def cmd_ask(args):
     backend = None
     if args[:1] == ["--backend"]:
         backend, args = args[1] if len(args) > 1 else None, args[2:]
-    request = " ".join(args).strip()
+    if args[:1] == ["--stdin"]:
+        try:
+            request = str(json.loads(sys.stdin.readline() or '""')).strip()
+        except ValueError:
+            request = ""
+    else:
+        request = " ".join(args).strip()
     if not request:
         emit({"type": "error", "text": "Type what you want changed or what's wrong."})
         return 2

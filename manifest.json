@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jburchel.omarchy-assistant",
   "name": "Omarchy Assistant",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Jim Burchel",
   "license": "MIT",
   "description": "Just say what you want changed. It reads your setup, shows the exact edit, applies it only when you approve, checks it worked, and undoes it in one key. Uses the Claude Code or Codex you already have.",

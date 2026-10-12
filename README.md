@@ -99,14 +99,14 @@ From a terminal or your own keybinding:
 
 ```bash
 omarchy-shell omarchy-assistant toggle
-omarchy-shell omarchy-assistant ask "make the gaps smaller"
+omarchy-shell omarchy-assistant ask "make the gaps smaller"   # this text is in your own command line
 omarchy-shell omarchy-assistant keybinding on    # or off
 ```
 
 The engine works on its own too:
 
 ```bash
-bin/omarchy-assistant ask "turn off animations"   # progress + proposal as JSON lines
+echo '"turn off animations"' | bin/omarchy-assistant ask --stdin   # progress + proposal as JSON lines
 bin/omarchy-assistant history                     # every change it has made
 bin/omarchy-assistant undo last                   # or a change id from history
 ```
@@ -117,6 +117,10 @@ The assistant itself sends nothing anywhere. To understand your setup, the AI to
 picked reads files on your machine and the output of its read-only checks (monitor names,
 keybindings, open window titles, recent log lines), and that goes to Anthropic or OpenAI
 under your own account, exactly as when you use Claude Code or Codex in a terminal.
+
+Your request and the details sent with it never appear in a process's command line, where
+other users on the same computer could read them: the assistant window hands the request to
+the engine on stdin, and the engine hands the prompt to Claude Code or Codex the same way.
 
 Backups and history are kept in `~/.local/state/omarchy-assistant/`, readable only by you.
 

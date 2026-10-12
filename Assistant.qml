@@ -92,7 +92,10 @@ Item {
         root.problems = [];
         root.phase = "asking";
         input.text = "";
-        askProc.command = [root.engine, "ask", "--backend", root.backendId, text];
+        // The request goes over stdin, never argv: other local users can read
+        // any process's command line.
+        askProc.request = text;
+        askProc.command = [root.engine, "ask", "--backend", root.backendId, "--stdin"];
         askProc.running = true;
     }
 
@@ -137,6 +140,12 @@ Item {
 
     Process {
         id: askProc
+        property string request: ""
+        stdinEnabled: true
+        onStarted: {
+            write(JSON.stringify(request) + "\n");
+            request = "";
+        }
         stdout: SplitParser { onRead: function(line) { root.handleEvent(line); } }
         onExited: function(code) {
             if (root.phase === "asking") {

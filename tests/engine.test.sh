@@ -114,5 +114,28 @@ check "theme restored on undo" "$(cat "$FAKE/theme")" "Tokyo Night"
 check "unknown probe refused" "$("$A" probe 'rm' >/dev/null; echo $?)" "2"
 check "injected probe argument refused" "$("$A" probe option '$(touch /tmp/x)' >/dev/null; echo $?)" "2"
 
+# 7. The request and the machine details never appear on a command line
+#    (other local users can read /proc/<pid>/cmdline). Stand-in AI tools
+#    record their argv and stdin.
+cat >"$tmp/bin/claude" <<'S'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE/claude.argv"; cat >"$FAKE/claude.stdin"
+echo '{"type":"result","result":"<proposal>{\"summary\":\"s\",\"answer\":\"a\",\"changes\":[],\"commands\":[]}</proposal>"}'
+S
+cat >"$tmp/bin/codex" <<'S'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE/codex.argv"; cat >"$FAKE/codex.stdin"
+while [[ $# -gt 0 ]]; do [[ $1 == -o ]] && echo '<proposal>{"summary":"s","answer":"a","changes":[],"commands":[]}</proposal>' >"$2"; shift; done
+S
+chmod +x "$tmp/bin/claude" "$tmp/bin/codex"
+secret="please fix my-private-request-9f2c"
+for b in claude codex; do
+  out=$(printf '%s\n' "$(jq -Rn --arg s "$secret" '$s')" | "$A" ask --backend $b --stdin | tail -1)
+  check "$b: answered from a stdin request" "$(jq -r .proposal.request <<<"$out")" "$secret"
+  check "$b: request not in its argv" "$(grep -c "private-request" "$FAKE/$b.argv")" "0"
+  check "$b: machine details not in its argv" "$(grep -c "Omarchy version" "$FAKE/$b.argv")" "0"
+  contains "$b: request reached it on stdin" "$(cat "$FAKE/$b.stdin")" "$secret"
+done
+
 echo "engine: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
