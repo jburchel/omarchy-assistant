@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jburchel.omarchy-assistant",
+  "name": "Omarchy Assistant",
+  "version": "0.1.0",
+  "author": "Jim Burchel",
+  "license": "MIT",
+  "description": "Tell it what you want changed, or what's wrong, in plain words. It looks at your setup, shows you the exact change, applies it only when you say so, checks it worked, and undoes it in one click. Uses the Claude Code or Codex you're already signed into.",
+  "kinds": [
+    "service",
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "overlay": "Assistant.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchy Assistant",
+    "description": "Opens the assistant: describe a change or a problem in plain words.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "icon": "assets/icon.svg"
+}

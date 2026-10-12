@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Omarchy Assistant engine.
+
+  omarchy-assistant backends                  which AI tools are installed (JSON)
+  omarchy-assistant ask [--backend B] TEXT    investigate read-only, print progress
+                                              and a proposal as JSON lines
+  omarchy-assistant preview FILE              diff and checks for a proposal (JSON)
+  omarchy-assistant apply FILE                back up, apply, validate, auto-revert
+  omarchy-assistant undo [ID|last]            put a change back
+  omarchy-assistant history                   recent changes (JSON)
+  omarchy-assistant probe NAME [ARG]          one read-only check (used by the AI)
+
+The AI never writes anything. It runs read-only (Claude Code --restricted with
+read tools and this script's probes only; Codex --sandbox read-only) and ends
+with a <proposal> JSON block. This script, not the AI, applies a proposal:
+every edit is an exact find-and-replace (or a new file) inside the user's own
+config, every command is on a fixed list, the originals are backed up first,
+Hyprland and JSON files are checked afterwards, and a failed check puts
+everything back. Each applied change can be undone.
+"""
+import datetime
+import difflib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+SELF = os.path.realpath(__file__)
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "omarchy-assistant")
+HISTORY = os.path.join(STATE, "history")
+JOBS = os.path.join(STATE, "jobs")
+ASK_TIMEOUT = 300
+
+# Where a proposal may write. Plugin code is excluded: plugins are other
+# people's software; their settings live in shell.json.
+WRITABLE = [os.path.join(HOME, ".config"), os.path.join(HOME, ".local/share/applications")]
+NOT_WRITABLE = [os.path.join(HOME, ".config/omarchy/plugins")]
+SECRETS = re.compile(r"(^|/)(gh|gnupg|ssh|op|1password|bitwarden|rclone|keyrings?|\.netrc|credentials|secrets?|tokens?)(/|$|\.)", re.I)
+
+COMMANDS = [
+    (re.compile(r"^hyprctl reload$"), "reload"),
+    (re.compile(r"^omarchy restart [a-z0-9-]+$"), "restart"),
+    (re.compile(r"^omarchy theme set [A-Za-z0-9 ._-]+$"), "theme"),
+    (re.compile(r"^omarchy toggle [a-z0-9 -]+$"), "toggle"),
+    (re.compile(r"^systemctl --user restart [A-Za-z0-9@._-]+$"), "restart-unit"),
+]
+
+
+# --------------------------------------------------------------------------- helpers
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def run(argv, timeout=30, **kw):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kw)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest() if text is not None else None
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def write_atomic(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o644
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".omarchy-assistant-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def pretty(path):
+    return "~" + path[len(HOME):] if path.startswith(HOME + "/") else path
+
+
+# --------------------------------------------------------------------------- probes
+
+def probe(name, arg=""):
+    """Fixed read-only checks the AI may run. Arguments are validated, never
+    passed through a shell."""
+    word = re.fullmatch(r"[A-Za-z0-9@._:-]{1,64}", arg or "") is not None
+    cmds = {
+        "monitors": [["hyprctl", "monitors", "all"]],
+        "binds": [["hyprctl", "binds"]],
+        "clients": [["hyprctl", "clients"]],
+        "workspaces": [["hyprctl", "workspaces"]],
+        "devices": [["hyprctl", "devices"]],
+        "configerrors": [["hyprctl", "configerrors"]],
+        "version": [["hyprctl", "version"], ["omarchy", "version"]],
+        "themes": [["omarchy", "theme", "current"], ["omarchy", "theme", "list"]],
+        "audio": [["wpctl", "status"], ["pactl", "info"], ["pactl", "list", "short", "sinks"], ["pactl", "list", "short", "sources"]],
+        "usb": [["lsusb"]],
+        "bluetooth": [["bluetoothctl", "devices", "Connected"], ["bluetoothctl", "devices"]],
+        "power": [["sh", "-c", "cat /sys/class/power_supply/*/online /sys/class/power_supply/*/capacity 2>/dev/null"], ["powerprofilesctl", "get"]],
+    }
+    if name in cmds:
+        argvs = cmds[name]
+    elif name == "option" and word:
+        argvs = [["hyprctl", "getoption", arg]]
+    elif name == "commands":
+        argvs = [["omarchy", arg, "--help"]] if word else [["omarchy", "commands"]]
+    elif name == "journal":
+        n = arg if re.fullmatch(r"\d{1,4}", arg or "") else "200"
+        argvs = [["journalctl", "--user", "-n", n, "--no-pager", "-o", "short"]]
+    elif name == "unit" and word:
+        argvs = [["systemctl", "--user", "status", arg, "--no-pager", "-n", "30"]]
+    else:
+        print("probes: monitors binds clients workspaces devices configerrors version themes audio usb bluetooth power\n"
+              "        option <name>  commands [group]  journal [lines]  unit <name>")
+        return 2
+    for argv in argvs:
+        code, out, err = run(argv)
+        print(f"$ {' '.join(argv)}\n{out}{err}".rstrip() + "\n")
+    return 0
+
+
+# --------------------------------------------------------------------------- proposal checks
+
+def resolve(file):
+    path = os.path.realpath(os.path.expanduser(file.strip()))
+    if not path.startswith("/"):
+        return None, f"{file}: not a full path"
+    if not any(path == w or path.startswith(w + "/") for w in WRITABLE):
+        return None, f"{pretty(path)}: outside your config (only ~/.config and ~/.local/share/applications)"
+    if any(path == n or path.startswith(n + "/") for n in NOT_WRITABLE):
+        return None, f"{pretty(path)}: plugin code is never edited"
+    if SECRETS.search(path[len(HOME):]):
+        return None, f"{pretty(path)}: looks like a credentials file"
+    return path, None
+
+
+def plan(proposal):
+    """Work out the new content of every file and check every command.
+    Returns (files, commands, problems); files = [{path, before, after, created}]."""
+    problems, files, by_path = [], [], {}
+    for i, ch in enumerate(proposal.get("changes") or []):
+        if not isinstance(ch, dict) or not isinstance(ch.get("file"), str):
+            problems.append(f"change {i + 1}: no file")
+            continue
+        path, err = resolve(ch["file"])
+        if err:
+            problems.append(err)
+            continue
+        entry = by_path.get(path)
+        if entry is None:
+            before = read(path)
+            entry = {"path": path, "before": before, "after": before, "created": before is None}
+            by_path[path] = entry
+            files.append(entry)
+        if "create" in ch:
+            if entry["before"] is not None:
+                problems.append(f"{pretty(path)}: already exists, so it can't be created")
+            elif not isinstance(ch["create"], str):
+                problems.append(f"{pretty(path)}: new file content is not text")
+            else:
+                entry["after"] = ch["create"]
+            continue
+        find, replace = ch.get("find"), ch.get("replace")
+        if not isinstance(find, str) or not isinstance(replace, str) or find == "":
+            problems.append(f"{pretty(path)}: an edit needs non-empty find text and replace text")
+            continue
+        if entry["after"] is None:
+            problems.append(f"{pretty(path)}: file does not exist")
+            continue
+        count = entry["after"].count(find)
+        if count != 1:
+            problems.append(f"{pretty(path)}: the text to change was found {count} times (it must be exactly once)")
+            continue
+        entry["after"] = entry["after"].replace(find, replace, 1)
+    commands = []
+    for c in proposal.get("commands") or []:
+        c = " ".join(str(c).split())
+        kind = next((k for rx, k in COMMANDS if rx.fullmatch(c)), None)
+        if kind is None:
+            problems.append(f"command not allowed: {c}")
+        else:
+            commands.append({"cmd": c, "kind": kind})
+    for f in files:
+        if f["path"].endswith(".json") and f["after"] is not None:
+            try:
+                json.loads(f["after"])
+            except ValueError as e:
+                problems.append(f"{pretty(f['path'])}: the change would make it invalid JSON ({e})")
+    return [f for f in files if f["after"] != f["before"]], commands, problems
+
+
+def diff(f):
+    a = (f["before"] or "").splitlines(keepends=True)
+    b = (f["after"] or "").splitlines(keepends=True)
+    return "".join(difflib.unified_diff(a, b, pretty(f["path"]), pretty(f["path"]), n=2))
+
+
+def preview_obj(proposal):
+    files, commands, problems = plan(proposal)
+    return {
+        "files": [{"path": pretty(f["path"]), "created": f["created"], "diff": diff(f)} for f in files],
+        "commands": [c["cmd"] for c in commands],
+        "problems": problems,
+        "canApply": not problems and bool(files or commands),
+    }
+
+
+# --------------------------------------------------------------------------- asking
+
+def backends():
+    found = []
+    if shutil.which("claude"):
+        found.append({"id": "claude", "name": "Claude Code"})
+    if shutil.which("codex"):
+        found.append({"id": "codex", "name": "Codex"})
+    return found
+
+
+def context():
+    lines = [f"Date: {datetime.datetime.now():%Y-%m-%d %H:%M}"]
+    code, out, _ = run(["omarchy", "version"])
+    if code == 0:
+        lines.append(f"Omarchy version: {out.strip()}")
+    code, out, _ = run(["hyprctl", "monitors", "-j"])
+    try:
+        mons = json.loads(out)
+        lines.append("Monitors: " + "; ".join(f"{m['name']} {m['width']}x{m['height']}@{round(m['refreshRate'])} scale {m['scale']} at {m['x']},{m['y']}" for m in mons))
+    except (ValueError, KeyError):
+        pass
+    code, out, _ = run(["omarchy", "theme", "current"])
+    if code == 0:
+        lines.append(f"Theme: {out.strip()}")
+    hypr = os.path.join(HOME, ".config/hypr")
+    if os.path.isdir(hypr):
+        lines.append("User Hyprland files: " + ", ".join(sorted(n for n in os.listdir(hypr) if not n.startswith(".") and ".bak" not in n)))
+    return "\n".join(lines)
+
+
+def prompt_for(request, backend):
+    guide = read(os.path.join(ROOT, "prompt/guide.md"))
+    probe_cmd = f"{SELF} probe"
+    probes = (f"\n## Checking the live system\n\nRun read-only checks with `{probe_cmd} <name> [arg]`. "
+              "Names: monitors, binds, clients, workspaces, devices, configerrors, version, themes, audio, usb, "
+              "bluetooth, power, option <hyprland option>, commands [omarchy group], journal [lines], unit <user unit>.\n")
+    if backend == "claude":
+        probes += "Other shell commands are not available to you; use your file reading and search tools for files.\n"
+    return f"{guide}{probes}\n## This machine\n\n{context()}\n\n## The request\n\n{request.strip()}\n"
+
+
+def status_for_tool(name, inp):
+    inp = inp or {}
+    if name == "Read":
+        return "Reading " + pretty(str(inp.get("file_path", "a file")))
+    if name in ("Grep", "Glob"):
+        return "Searching " + pretty(str(inp.get("path", "config")))
+    if name == "Bash":
+        m = re.search(r"probe\s+([\w.:@-]+)(?:\s+([\w.:@-]+))?", str(inp.get("command", "")))
+        return f"Checking {m.group(1)}" + (f" {m.group(2)}" if m and m.group(2) else "") if m else "Checking the system"
+    return "Working"
+
+
+def extract(text):
+    m = re.findall(r"<proposal>\s*(\{.*?\})\s*</proposal>", text or "", re.S)
+    if not m:
+        return None
+    try:
+        p = json.loads(m[-1])
+    except ValueError:
+        return None
+    p.setdefault("changes", [])
+    p.setdefault("commands", [])
+    p["summary"] = str(p.get("summary") or "Change")[:80]
+    p["answer"] = str(p.get("answer") or "")
+    return p
+
+
+def ask_claude(prompt, workdir):
+    argv = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+            "--restricted", "--strict-mcp-config", "--no-session-persistence",
+            "--permission-mode", "default",
+            "--tools", "Read,Grep,Glob,Bash",
+            "--allowedTools", "Read", "Grep", "Glob", f"Bash({SELF} probe:*)",
+            "--add-dir", "/usr/share/omarchy", os.path.join(HOME, ".config"), os.path.join(HOME, ".local/share/applications")]
+    final = ""
+    proc = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "assistant":
+                for item in (ev.get("message") or {}).get("content") or []:
+                    if item.get("type") == "tool_use":
+                        emit({"type": "status", "text": status_for_tool(item.get("name"), item.get("input"))})
+            elif ev.get("type") == "result":
+                final = ev.get("result") or ""
+                if ev.get("is_error"):
+                    if re.search(r"401|log ?in|not logged|authenticat", final, re.I):
+                        return None, "Claude Code isn't signed in. Run `claude` in a terminal and sign in, then try again."
+                    return None, final or "Claude Code reported an error"
+        proc.wait(timeout=ASK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return None, "Claude Code took too long"
+    if proc.returncode != 0 and not final:
+        return None, (proc.stderr.read() or "Claude Code failed").strip()[:400]
+    return final, None
+
+
+def ask_codex(prompt, workdir):
+    last = os.path.join(workdir, "last-message.txt")
+    argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral",
+            "--json", "-C", workdir, "-o", last, prompt]
+    proc = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            item = ev.get("item") or {}
+            message = str(ev.get("message") or item.get("message") or "")
+            if (ev.get("type") == "error" or item.get("type") == "error") and re.search(r"401|Unauthorized|not logged in|login", message, re.I):
+                proc.kill()
+                return None, "Codex isn't signed in. Run `codex login` in a terminal, then try again."
+            if ev.get("type") in ("turn.failed", "error") and "Reconnecting" not in message:
+                proc.kill()
+                return None, "Codex failed: " + message[:300]
+            if ev.get("type") == "item.started" and item.get("type") == "command_execution":
+                cmd = str(item.get("command", ""))
+                m = re.search(r"probe\s+(\S+)", cmd)
+                emit({"type": "status", "text": f"Checking {m.group(1)}" if m else "Running " + cmd[:60]})
+        proc.wait(timeout=ASK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return None, "Codex took too long"
+    text = read(last)
+    if not text:
+        return None, (proc.stderr.read() or "Codex failed").strip()[:400]
+    return text, None
+
+
+def cmd_ask(args):
+    backend = None
+    if args[:1] == ["--backend"]:
+        backend, args = args[1] if len(args) > 1 else None, args[2:]
+    request = " ".join(args).strip()
+    if not request:
+        emit({"type": "error", "text": "Type what you want changed or what's wrong."})
+        return 2
+    available = [b["id"] for b in backends()]
+    backend = backend if backend in available else (available[0] if available else None)
+    if not backend:
+        emit({"type": "error", "text": "No AI tool found. Install and sign in to Claude Code (claude) or Codex (codex)."})
+        return 1
+    job = uuid.uuid4().hex[:12]
+    workdir = private_dir(os.path.join(JOBS, job))
+    emit({"type": "status", "text": f"Asking {dict((b['id'], b['name']) for b in backends())[backend]}", "job": job})
+    prompt = prompt_for(request, backend)
+    text, err = (ask_claude if backend == "claude" else ask_codex)(prompt, workdir)
+    if err:
+        emit({"type": "error", "text": err})
+        return 1
+    proposal = extract(text)
+    if proposal is None:
+        emit({"type": "done", "job": job, "proposal": {"summary": "Answer", "answer": text.strip()[-2000:], "changes": [], "commands": []},
+              "preview": {"files": [], "commands": [], "problems": [], "canApply": False}})
+        return 0
+    proposal["request"] = request
+    proposal["backend"] = backend
+    path = os.path.join(workdir, "proposal.json")
+    with open(path, "w") as f:
+        json.dump(proposal, f, indent=1)
+    emit({"type": "done", "job": job, "proposalFile": path, "proposal": proposal, "preview": preview_obj(proposal)})
+    return 0
+
+
+# --------------------------------------------------------------------------- applying
+
+def hypr_changed(paths):
+    return any(p.startswith(os.path.join(HOME, ".config/hypr/")) and p.endswith(".lua") for p in paths)
+
+
+def validate(paths):
+    """Problems after a change: Hyprland config errors, broken JSON."""
+    problems = []
+    if hypr_changed(paths):
+        run(["hyprctl", "reload"])
+        code, out, _ = run(["hyprctl", "configerrors"])
+        errors = [l for l in out.splitlines() if l.strip()]
+        if errors:
+            problems.append("Hyprland reported errors: " + " | ".join(errors[:3]))
+    for p in paths:
+        if p.endswith(".json") and os.path.exists(p):
+            try:
+                json.loads(read(p))
+            except ValueError as e:
+                problems.append(f"{pretty(p)} is not valid JSON: {e}")
+    return problems
+
+
+def restore(manifest, folder):
+    for f in manifest["files"]:
+        if f["existed"]:
+            with open(os.path.join(folder, f["backup"]), encoding="utf-8") as src:
+                write_atomic(f["path"], src.read())
+        elif os.path.exists(f["path"]):
+            os.remove(f["path"])
+
+
+def run_commands(commands):
+    out = []
+    for c in commands:
+        code, _, err = run(c["cmd"].split(" ", 3) if c["kind"] == "theme" else c["cmd"].split(), timeout=120)
+        out.append({"cmd": c["cmd"], "ok": code == 0, "error": err.strip()[:200] if code else ""})
+    return out
+
+
+def cmd_apply(args):
+    if not args:
+        emit({"ok": False, "problems": ["no proposal file"]})
+        return 2
+    with open(args[0]) as f:
+        proposal = json.load(f)
+    files, commands, problems = plan(proposal)
+    if problems or not (files or commands):
+        emit({"ok": False, "problems": problems or ["nothing to apply"]})
+        return 1
+    change = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
+    folder = private_dir(os.path.join(HISTORY, change))
+    manifest = {"id": change, "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                "summary": proposal.get("summary", "Change"), "request": proposal.get("request", ""),
+                "files": [], "commands": [c["cmd"] for c in commands], "status": "applying"}
+    for i, f in enumerate(files):
+        entry = {"path": f["path"], "existed": f["before"] is not None, "backup": f"{i}.orig",
+                 "shaBefore": sha(f["before"]), "shaAfter": sha(f["after"])}
+        if f["before"] is not None:
+            with open(os.path.join(folder, entry["backup"]), "w", encoding="utf-8") as b:
+                b.write(f["before"])
+        manifest["files"].append(entry)
+    if any(c["kind"] == "theme" for c in commands):
+        code, out, _ = run(["omarchy", "theme", "current"])
+        manifest["themeBefore"] = out.strip() if code == 0 else None
+    save = lambda: json.dump(manifest, open(os.path.join(folder, "manifest.json"), "w"), indent=1)
+    save()
+    for f in files:
+        write_atomic(f["path"], f["after"])
+    ran = run_commands(commands)
+    problems = validate([f["path"] for f in files]) + [f"{r['cmd']} failed: {r['error']}" for r in ran if not r["ok"]]
+    if problems:
+        restore(manifest, folder)
+        validate([f["path"] for f in files])
+        manifest["status"] = "reverted"
+        manifest["problems"] = problems
+        save()
+        emit({"ok": False, "reverted": True, "change": change, "problems": problems})
+        return 1
+    manifest["status"] = "applied"
+    save()
+    emit({"ok": True, "change": change, "summary": manifest["summary"], "files": [pretty(f["path"]) for f in files], "commands": manifest["commands"]})
+    return 0
+
+
+def manifests():
+    if not os.path.isdir(HISTORY):
+        return []
+    out = []
+    for name in sorted(os.listdir(HISTORY), reverse=True):
+        try:
+            with open(os.path.join(HISTORY, name, "manifest.json")) as f:
+                out.append(json.load(f))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def cmd_undo(args):
+    target = args[0] if args else "last"
+    pool = [m for m in manifests() if m.get("status") == "applied"]
+    m = pool[0] if target == "last" and pool else next((x for x in pool if x["id"] == target), None)
+    if m is None:
+        emit({"ok": False, "problems": ["nothing to undo"]})
+        return 1
+    folder = os.path.join(HISTORY, m["id"])
+    force = "--force" in args
+    changed_since = [pretty(f["path"]) for f in m["files"] if sha(read(f["path"])) != f["shaAfter"]]
+    if changed_since and not force:
+        emit({"ok": False, "problems": [f"{p} changed after this change was applied; undoing would lose that edit" for p in changed_since], "canForce": True})
+        return 1
+    restore(m, folder)
+    problems = validate([f["path"] for f in m["files"]])
+    if m.get("themeBefore"):
+        run(["omarchy", "theme", "set", m["themeBefore"]], timeout=120)
+    for c in m.get("commands", []):
+        if c.startswith("omarchy toggle "):
+            run(c.split(), timeout=60)   # a toggle undoes itself
+    m["status"] = "undone"
+    json.dump(m, open(os.path.join(folder, "manifest.json"), "w"), indent=1)
+    emit({"ok": not problems, "change": m["id"], "summary": m["summary"], "problems": problems})
+    return 0
+
+
+def cmd_history(args):
+    emit([{k: m.get(k) for k in ("id", "time", "summary", "request", "status", "commands")} | {"files": [pretty(f["path"]) for f in m["files"]]}
+          for m in manifests()[:30]])
+    return 0
+
+
+def main(argv):
+    private_dir(STATE)
+    cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ("", [])
+    if cmd == "backends":
+        emit(backends())
+        return 0
+    if cmd == "ask":
+        return cmd_ask(args)
+    if cmd == "preview" and args:
+        with open(args[0]) as f:
+            emit(preview_obj(json.load(f)))
+        return 0
+    if cmd == "apply":
+        return cmd_apply(args)
+    if cmd == "undo":
+        return cmd_undo(args)
+    if cmd == "history":
+        return cmd_history(args)
+    if cmd == "probe" and args:
+        return probe(args[0], args[1] if len(args) > 1 else "")
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
