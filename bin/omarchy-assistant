@@ -272,10 +272,16 @@ def prompt_for(request, backend):
 
 def status_for_tool(name, inp):
     inp = inp or {}
+
+    def where(path, fallback):
+        # The AI's own scratch output (Claude Code keeps long results under ~/.claude) means nothing to the person.
+        shown = pretty(str(path or fallback))
+        return fallback if shown.startswith(("~/.claude/", "~/.local/state/omarchy-assistant/")) else shown
+
     if name == "Read":
-        return "Reading " + pretty(str(inp.get("file_path", "a file")))
+        return "Reading " + where(inp.get("file_path"), "earlier results")
     if name in ("Grep", "Glob"):
-        return "Searching " + pretty(str(inp.get("path", "config")))
+        return "Searching " + where(inp.get("path"), "earlier results" if inp.get("path") else "config")
     if name == "Bash":
         m = re.search(r"probe\s+([\w.:@-]+)(?:\s+([\w.:@-]+))?", str(inp.get("command", "")))
         return f"Checking {m.group(1)}" + (f" {m.group(2)}" if m and m.group(2) else "") if m else "Checking the system"
