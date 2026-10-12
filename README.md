@@ -11,6 +11,12 @@ no API key to set up and nothing new to pay for.
 
 ![Omarchy Assistant: a plain-words request, the explanation and the exact diff, with Apply and Discard](preview.png)
 
+### See it work
+
+Ask, read the diff, apply, undo. A real request at real speed (the recorder skips frames where nothing changes):
+
+![Demo: "make the gaps between windows smaller", the proposal, Apply, then Undo](docs/demo.gif)
+
 ## Why it's safe to let an AI near your config
 
 The AI never writes anything. It runs read-only, looks around, and hands back a *proposal*.
